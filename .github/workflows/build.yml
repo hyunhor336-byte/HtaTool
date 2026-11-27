@@ -1,0 +1,253 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths: [index.html, .github/workflows/build.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Create Android project
+        run: |
+          test -f index.html || { echo "index.html is missing"; exit 1; }
+          mkdir -p p/app/src/main/java/com/hta/tool p/app/src/main/assets
+          cp index.html p/app/src/main/assets/
+          if [ -n "$KEYSTORE_B64" ]; then echo "$KEYSTORE_B64" | base64 -d > p/app/release.jks; fi
+          cat > p/settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "HtaTool"
+          include ":app"
+          EOF
+          cat > p/app/build.gradle <<'EOF'
+          plugins { id "com.android.application" version "8.7.3" }
+          android {
+            namespace "com.hta.tool"
+            compileSdk 35
+            defaultConfig {
+              applicationId "com.hta.tool"
+              minSdk 29
+              targetSdk 35
+              versionCode((System.getenv("GITHUB_RUN_NUMBER") ?: "1") as Integer)
+              versionName "1.0"
+            }
+            signingConfigs {
+              own {
+                if (System.getenv("KEYSTORE_PASSWORD")) {
+                  storeFile file("release.jks")
+                  storePassword System.getenv("KEYSTORE_PASSWORD")
+                  keyAlias System.getenv("KEY_ALIAS")
+                  keyPassword System.getenv("KEYSTORE_PASSWORD")
+                }
+              }
+            }
+            buildTypes {
+              release { signingConfig System.getenv("KEYSTORE_PASSWORD") ? signingConfigs.own : signingConfigs.debug }
+            }
+            lint { checkReleaseBuilds false }
+          }
+          EOF
+          cat > p/app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+            <queries>
+              <intent>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+              </intent>
+            </queries>
+            <application android:label="HtaTool" android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true"
+                  android:configChanges="orientation|screenSize|keyboardHidden|uiMode">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > p/app/src/main/java/com/hta/tool/MainActivity.java <<'EOF'
+          package com.hta.tool;
+
+          import android.app.Activity;
+          import android.content.*;
+          import android.content.pm.*;
+          import android.net.Uri;
+          import android.os.*;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.*;
+          import org.json.*;
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+            private WebView web;
+            private ValueCallback<Uri[]> picker;
+
+            @Override protected void onCreate(Bundle state) {
+              super.onCreate(state);
+              web = new WebView(this);
+              setContentView(web);
+              WebSettings s = web.getSettings();
+              s.setJavaScriptEnabled(true);
+              s.setDomStorageEnabled(true);
+              web.addJavascriptInterface(new Bridge(), "HtaBridge");
+              web.setWebViewClient(new WebViewClient() {
+                @Override public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                  if ("app.local".equals(r.getUrl().getHost())) return false;
+                  try { startActivity(new Intent(Intent.ACTION_VIEW, r.getUrl())); } catch (Exception ignored) {}
+                  return true;
+                }
+              });
+              web.setWebChromeClient(new WebChromeClient() {
+                @Override public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                  if (picker != null) picker.onReceiveValue(null);
+                  picker = cb;
+                  Intent i = new Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
+                  i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, p.getMode() == FileChooserParams.MODE_OPEN_MULTIPLE);
+                  try { startActivityForResult(i, 1); } catch (Exception e) { picker = null; return false; }
+                  return true;
+                }
+              });
+              try (InputStream in = getAssets().open("index.html")) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] b = new byte[65536];
+                for (int n; (n = in.read(b)) > 0; ) out.write(b, 0, n);
+                web.loadDataWithBaseURL("https://app.local/", new String(out.toByteArray(), StandardCharsets.UTF_8), "text/html", "utf-8", null);
+              } catch (IOException e) { throw new RuntimeException(e); }
+            }
+
+            @Override protected void onActivityResult(int req, int res, Intent data) {
+              if (req != 1 || picker == null) return;
+              Uri[] u = null;
+              if (res == RESULT_OK && data != null) {
+                ClipData c = data.getClipData();
+                if (c != null) {
+                  u = new Uri[c.getItemCount()];
+                  for (int i = 0; i < u.length; i++) u[i] = c.getItemAt(i).getUri();
+                } else if (data.getData() != null) u = new Uri[]{data.getData()};
+              }
+              picker.onReceiveValue(u);
+              picker = null;
+            }
+
+            class Bridge {
+              private OutputStream out;
+              private Uri uri;
+              private String name;
+
+              @JavascriptInterface public String begin(String fn) {
+                try {
+                  if (out != null) out.close();
+                  name = fn;
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.Downloads.DISPLAY_NAME, fn);
+                  v.put(MediaStore.Downloads.MIME_TYPE, mime(fn));
+                  uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                  out = getContentResolver().openOutputStream(uri);
+                  return "ok";
+                } catch (Exception e) { return String.valueOf(e.getMessage()); }
+              }
+
+              @JavascriptInterface public String chunk(String data) {
+                try { out.write(Base64.decode(data, Base64.DEFAULT)); return "ok"; }
+                catch (Exception e) { return String.valueOf(e.getMessage()); }
+              }
+
+              @JavascriptInterface public String finish(boolean install) {
+                try {
+                  out.close();
+                  out = null;
+                  if (install && name.toLowerCase().endsWith(".apk")) {
+                    startActivity(new Intent(Intent.ACTION_VIEW)
+                        .setDataAndType(uri, mime(name))
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK));
+                  }
+                  return "ok:Download/" + name;
+                } catch (Exception e) { return String.valueOf(e.getMessage()); }
+              }
+
+              @JavascriptInterface public String share() {
+                try {
+                  Intent i = new Intent(Intent.ACTION_SEND).setType(mime(name)).putExtra(Intent.EXTRA_STREAM, uri);
+                  i.setClipData(ClipData.newRawUri(name, uri));
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                  startActivity(Intent.createChooser(i, name));
+                  return "ok";
+                } catch (Exception e) { return String.valueOf(e.getMessage()); }
+              }
+
+              @JavascriptInterface public String listApps() {
+                try {
+                  PackageManager pm = getPackageManager();
+                  JSONArray a = new JSONArray();
+                  for (ApplicationInfo i : pm.getInstalledApplications(0)) {
+                    if (pm.getLaunchIntentForPackage(i.packageName) == null) continue;
+                    a.put(new JSONObject()
+                        .put("name", pm.getApplicationLabel(i).toString())
+                        .put("pkg", i.packageName)
+                        .put("size", new File(i.sourceDir).length())
+                        .put("split", i.splitSourceDirs != null));
+                  }
+                  return a.toString();
+                } catch (Exception e) { return "[]"; }
+              }
+
+              @JavascriptInterface public String readApk(String pkg, double offset) {
+                try (RandomAccessFile f = new RandomAccessFile(getPackageManager().getApplicationInfo(pkg, 0).sourceDir, "r")) {
+                  f.seek((long) offset);
+                  byte[] b = new byte[(int) Math.min(393216, f.length() - f.getFilePointer())];
+                  f.readFully(b);
+                  return Base64.encodeToString(b, Base64.NO_WRAP);
+                } catch (Exception e) { return ""; }
+              }
+
+              private String mime(String fn) {
+                String n = fn.toLowerCase();
+                if (n.endsWith(".apk")) return "application/vnd.android.package-archive";
+                if (n.endsWith(".html")) return "text/html";
+                return "application/octet-stream";
+              }
+            }
+          }
+          EOF
+
+      - name: Build and verify signature
+        working-directory: p
+        run: |
+          gradle --no-daemon :app:assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../HtaTool.apk
+          "$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)/apksigner" verify --verbose ../HtaTool.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HtaTool
+          path: HtaTool.apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v${{ github.run_number }}-${{ github.run_attempt }}" HtaTool.apk --title "HtaTool ${{ github.run_number }}" --notes "APK build" --latest
